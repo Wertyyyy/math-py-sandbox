@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from fastmcp import Client
+from fastmcp.client.transports import PythonStdioTransport
 
 
 WORKSPACE_DIR = Path(__file__).resolve().parents[1]
@@ -16,9 +15,21 @@ VENV_PYTHON = WORKSPACE_DIR / ".venv" / "bin" / "python"
 SERVER_SCRIPT = WORKSPACE_DIR / "server.py"
 
 
+class TestClient:
+    def __init__(self, client: Client):
+        self._client = client
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+    async def call_tool(self, name, arguments=None, **kwargs):
+        kwargs.setdefault("raise_on_error", False)
+        return await self._client.call_tool(name, arguments, **kwargs)
+
+
 def build_server_env(
     *,
-    exec_timeout_seconds: int = 2,
+    exec_timeout_seconds: int = 10,
     init_timeout_seconds: int = 20,
     process_time_limit_seconds: int = 600,
     max_sessions: int = 128,
@@ -40,33 +51,25 @@ def ensure_test_environment() -> None:
 @asynccontextmanager
 async def open_client_session(
     *,
-    exec_timeout_seconds: int = 2,
+    exec_timeout_seconds: int = 10,
     init_timeout_seconds: int = 20,
     process_time_limit_seconds: int = 600,
     max_sessions: int = 128,
-) -> AsyncIterator[ClientSession]:
+) -> AsyncIterator[TestClient]:
     ensure_test_environment()
-    server_params = StdioServerParameters(
-        command=str(VENV_PYTHON),
-        args=[str(SERVER_SCRIPT)],
+    transport = PythonStdioTransport(
+        SERVER_SCRIPT,
         env=build_server_env(
             exec_timeout_seconds=exec_timeout_seconds,
             init_timeout_seconds=init_timeout_seconds,
             process_time_limit_seconds=process_time_limit_seconds,
             max_sessions=max_sessions,
         ),
+        python_cmd=str(VENV_PYTHON),
     )
 
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            yield session
-
-
-def run_async(coro):
-    return asyncio.run(coro)
-
-
+    async with Client(transport) as client:
+        yield TestClient(client)
 def tool_text(result) -> str:
     parts = []
     for item in result.content:

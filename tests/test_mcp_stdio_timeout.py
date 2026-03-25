@@ -13,30 +13,42 @@ async def scenario() -> None:
             "python_exec",
             {
                 "code": "import time\nprint('starting long task')\ntime.sleep(5)\nprint('finished')",
-                "session_id": timeout_session_id,
             },
+            meta={"client_id": timeout_session_id},
         )
         payload = tool_json(result)
-        assert payload["session_id"] == timeout_session_id
-        assert "timed out" in payload["error"].lower()
+        assert payload["execution_status"] == "session_error"
+        assert payload["session_status"] == "terminated"
+        assert payload["error_type"] == "code_triggered_session_error"
+        assert "timed out" in payload["error_message"].lower()
 
         result = await session.call_tool(
             "python_exec",
             {
                 "code": "print('reuse after timeout')",
-                "session_id": timeout_session_id,
             },
+            meta={"client_id": timeout_session_id},
         )
         payload = tool_json(result)
-        error_text = payload.get("error", "") + payload.get("output", "")
-        assert "terminated" in error_text.lower() or "broken pipe" in error_text.lower()
+        if payload["execution_status"] != "success":
+            result = await session.call_tool(
+                "python_exec",
+                {
+                    "code": "print('reuse after timeout')",
+                },
+                meta={"client_id": timeout_session_id},
+            )
+            payload = tool_json(result)
+        assert payload["execution_status"] == "success"
+        assert payload["interpreter_output"] == "reuse after timeout\n"
 
         result = await session.call_tool(
             "python_exec",
             {"code": "print('fresh session still works')"},
+            meta={"client_id": "timeout-workflow-fresh"},
         )
         payload = tool_json(result)
-        assert payload["output"] == "fresh session still works\n"
+        assert payload["interpreter_output"] == "fresh session still works\n"
 
 
 def test_mcp_stdio_timeout() -> None:

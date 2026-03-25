@@ -1,13 +1,33 @@
 import subprocess
 import os
-import uuid
 import json
 import threading
 import time
 import base64
 from typing import Dict
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
+
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "4")
+
+
+# -----------------------------
+# Configuration
+# -----------------------------
+HOST_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+NSJAIL_BIN = os.path.join(HOST_PROJECT_DIR, "nsjail", "nsjail")
+HOST_VENV_PYTHON = os.path.join(HOST_PROJECT_DIR, ".venv", "bin", "python")
+HOST_REPL_RUNNER = os.path.join(HOST_PROJECT_DIR, "jail-root", "app", "repl_runner.py")
+
+THREAD_ENV_VARS = [
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+]
 
 
 # -----------------------------
@@ -18,22 +38,15 @@ from fastmcp import FastMCP
 class PythonSession:
     def __init__(
         self,
-        session_id: str,
-        *,
-        nsjail_bin: str,
-        host_venv_python: str,
-        host_repl_runner: str,
-        exec_timeout_seconds: int,
-        init_timeout_seconds: int,
-        process_time_limit_seconds: int,
     ):
-        self.session_id = session_id
-        self.nsjail_bin = nsjail_bin
-        self.host_venv_python = host_venv_python
-        self.host_repl_runner = host_repl_runner
-        self.exec_timeout_seconds = exec_timeout_seconds
-        self.init_timeout_seconds = init_timeout_seconds
-        self.process_time_limit_seconds = process_time_limit_seconds
+        self.nsjail_bin = os.getenv("NSJAIL_BIN", NSJAIL_BIN)
+        self.host_venv_python = os.getenv("HOST_VENV_PYTHON", HOST_VENV_PYTHON)
+        self.host_repl_runner = os.getenv("HOST_REPL_RUNNER", HOST_REPL_RUNNER)
+        self.exec_timeout_seconds = int(os.getenv("EXEC_TIMEOUT_SECONDS", "10"))
+        self.init_timeout_seconds = int(os.getenv("INIT_TIMEOUT_SECONDS", "20"))
+        self.process_time_limit_seconds = int(
+            os.getenv("PROCESS_TIME_LIMIT_SECONDS", "600")
+        )
         self.proc = self._start_process()
         self.lock = threading.Lock()
         self._wait_until_ready()
@@ -85,6 +98,8 @@ class PythonSession:
                 "--quiet",
                 "--time_limit",
                 str(self.process_time_limit_seconds),
+                "--keep_env",
+                *[item for name in THREAD_ENV_VARS for item in ("--env", name)],
                 "--disable_clone_newuser",
                 "--disable_clone_newnet",
                 "--disable_clone_newns",
@@ -160,7 +175,7 @@ class PythonSession:
                     raise RuntimeError(
                         "Error response missing 'error' field from repl_runner"
                     )
-                return response["error"]
+                raise CodeExecutionError(response["error"])
 
             else:
                 self.close()
@@ -179,33 +194,73 @@ class PythonSession:
             pass
 
 
-sessions: Dict[str, PythonSession] = {}
-
-
-def _active_session_count() -> int:
-    return sum(1 for session in sessions.values() if session.proc.poll() is None)
-
-
-# -----------------------------
-# Configuration
-# -----------------------------
-HOST_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-NSJAIL_BIN = os.path.join(HOST_PROJECT_DIR, "nsjail", "nsjail")
-HOST_VENV_PYTHON = os.path.join(HOST_PROJECT_DIR, ".venv", "bin", "python")
-EXEC_TIMEOUT_SECONDS = int(os.getenv("EXEC_TIMEOUT_SECONDS", "10"))
-INIT_TIMEOUT_SECONDS = int(os.getenv("INIT_TIMEOUT_SECONDS", "20"))
-PROCESS_TIME_LIMIT_SECONDS = int(os.getenv("PROCESS_TIME_LIMIT_SECONDS", "600"))
 MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", "128"))
-HOST_REPL_RUNNER = os.path.join(HOST_PROJECT_DIR, "jail-root", "app", "repl_runner.py")
 
-if not os.path.isfile(NSJAIL_BIN):
-    raise FileNotFoundError(f"nsjail binary not found: {NSJAIL_BIN}")
+sessions: Dict[str, PythonSession] = {}
+sessions_lock = threading.Lock()
 
-if not os.path.isfile(HOST_VENV_PYTHON):
-    raise FileNotFoundError(f"venv python not found: {HOST_VENV_PYTHON}")
 
-if not os.path.isfile(HOST_REPL_RUNNER):
-    raise FileNotFoundError(f"repl runner not found: {HOST_REPL_RUNNER}")
+def _session_is_alive(session: PythonSession) -> bool:
+    return session.proc.poll() is None
+
+
+def _prune_dead_sessions_unlocked() -> None:
+    dead_session_ids = [
+        session_id
+        for session_id, session in sessions.items()
+        if not _session_is_alive(session)
+    ]
+    for session_id in dead_session_ids:
+        sessions.pop(session_id, None)
+
+
+def _require_client_id(ctx: Context) -> str:
+    client_id = ctx.client_id
+    if not client_id:
+        raise RuntimeError("client_id is required to manage a Python session")
+    return client_id
+
+
+def _spawn_session() -> PythonSession:
+    return PythonSession()
+
+
+class CodeExecutionError(RuntimeError):
+    """Code execution failed while the interpreter session remains healthy."""
+
+
+def _get_or_create_session(session_id: str) -> tuple[PythonSession, bool]:
+    with sessions_lock:
+        _prune_dead_sessions_unlocked()
+
+        existing_session = sessions.get(session_id)
+        if existing_session is not None and _session_is_alive(existing_session):
+            return existing_session, False
+
+        if existing_session is not None:
+            existing_session.close()
+            sessions.pop(session_id, None)
+
+        if len(sessions) >= MAX_SESSIONS:
+            raise RuntimeError(
+                f"Maximum active session limit reached ({MAX_SESSIONS}). "
+                "Please reset an existing session before creating a new one."
+            )
+
+        new_session = _spawn_session()
+        sessions[session_id] = new_session
+        return new_session, True
+
+
+def _reset_session(session_id: str) -> bool:
+    with sessions_lock:
+        session = sessions.pop(session_id, None)
+
+    if session is None:
+        return False
+
+    session.close()
+    return True
 
 
 # -----------------------------
@@ -214,13 +269,66 @@ if not os.path.isfile(HOST_REPL_RUNNER):
 
 mcp = FastMCP("python")
 
+CODE_EXEC_SUCCESS = "The code executed successfully. The session remains active and all variables/definitions are preserved for subsequent calls."
+CODE_EXEC_ERROR = "The code execution failed. The session remains active; previously created variables are preserved."
+SESSION_ERROR = "The session has been terminated and all resources are freed. Please redefine all functions and variables in a new session on your next call."
 
-@mcp.tool()
-def python_exec(code: str, session_id: str | None = None) -> str:
+
+def _python_exec_success(output: str) -> str:
+    return json.dumps(
+        {
+            "interpreter_output": output,
+            "session_status": "active",
+            "execution_status": "success",
+            "error_type": None,
+            "error_message": None,
+        }
+    )
+
+
+def _python_exec_code_error(output: str) -> str:
+    return json.dumps(
+        {
+            "interpreter_output": output,
+            "session_status": "active",
+            "execution_status": "code_error",
+            "error_type": "code_execution_error",
+            "error_message": CODE_EXEC_ERROR,
+        }
+    )
+
+
+def _python_exec_session_error(
+    *,
+    error_type: str,
+    error_message: str,
+    session_status: str,
+) -> str:
+    return json.dumps(
+        {
+            "interpreter_output": None,
+            "session_status": session_status,
+            "execution_status": "session_error",
+            "error_type": error_type,
+            "error_message": error_message,
+        }
+    )
+
+
+def _is_code_triggered_session_error(error_message: str) -> bool:
+    lowered = error_message.lower()
+    return (
+        "timed out" in lowered
+        or "terminated unexpectedly" in lowered
+        or "python session terminated" in lowered
+    )
+
+@mcp.tool(tags={"llm"})
+def python_exec(code: str, ctx: Context) -> str:
     """
     This tool runs Python code in an isolated, sandboxed environment using nsjail.
     Multiple code executions can be performed in the same session, preserving variables
-    and state between calls. Each session has strict time and resource limits for security.
+    and state between calls. Each client gets its own session, keyed by client_id.
 
     The execution environment includes numpy, scipy, and sympy. No other third-party
     libraries are available.
@@ -230,8 +338,10 @@ def python_exec(code: str, session_id: str | None = None) -> str:
     code : str
         Python code to execute as a string. Can include multiple lines, imports,
         function definitions, loops, etc. Any print output is captured and returned.
-        Please import any required libraries (e.g. numpy, scipy, sympy)
-        within the code string.
+        Please import any required libraries (e.g. numpy, scipy, sympy) within 
+        the code string.
+        Please print the final results to stdout, as only print output is captured 
+        and returned.
 
         Examples of valid code:
         - "print('hello')"
@@ -242,17 +352,6 @@ def python_exec(code: str, session_id: str | None = None) -> str:
         - "import scipy; print(scipy.optimize.fmin(lambda x: x**2, 5))"
         - "import sympy as sp; x = sp.Symbol('x'); print(sp.solve(x**2 - 4, x))"
 
-    session_id : str | None, optional
-        A unique identifier for the Python session. If None, a new UUID is automatically
-        generated and a fresh session is created. All subsequent calls with the same
-        session_id execute in the same session context, preserving variables, imports,
-        and function definitions. Default is None (creates a new session).
-
-        Best practices:
-        - Reuse session_id to maintain state across multiple executions
-        - Store session_id for later use if you need to execute more code in the same context
-        - Pass None to create separate isolated sessions when needed
-
     Returns:
     --------
     str (JSON format)
@@ -260,74 +359,145 @@ def python_exec(code: str, session_id: str | None = None) -> str:
 
         On Success:
         {
-            "session_id": "<str>",      # The session ID (new or provided)
-            "output": "<str>"           # The captured stdout from code execution
+            "interpreter_output": "<str>"
+            "session_status": "active"
+            "execution_status": "success"
+            "error_type": null
         }
         The session remains active and all variables/definitions are preserved for
-        subsequent calls using the same session_id.
+        subsequent calls.
 
         On Execution Error (code-level exception):
         {
-            "session_id": "<str>",
-            "output": "<str>"           # Traceback and error message
+            "interpreter_output": "<str>"
+            "session_status": "active"
+            "execution_status": "code_error"
+            "error_type": "code_execution_error"
         }
-        The session remains active; previously created variables are preserved and
-        you can continue using this session_id.
+        The session remains active; previously created variables are preserved.
 
         On Session Error (timeout, crash, resource limit exceeded):
         {
-            "session_id": "<str>",
-            "error": "<str>"            # Error description (session terminated)
+            "interpreter_output": null
+            "session_status": "terminated" | "unavailable"
+            "execution_status": "session_error"
+            "error_type": "code_triggered_session_error" | "session_infrastructure_error"
+            "error_message": "<str>"
         }
-        The session has been terminated and all resources are freed. The session_id
-        cannot be reused. If you need to continue, pass session_id=None to create
-        a new session. Note: if code execution times out, the entire session is
-        automatically terminated.
+        The session has been terminated and all resources are freed.
+        A new session is created automatically on the next call.
+        Note: if code execution times out, the entire session is automatically
+        terminated.
     """
 
-    if session_id is None:
-        session_id = str(uuid.uuid4())
+    session_id = _require_client_id(ctx)
+    session = None
 
-    if session_id not in sessions:
-        if _active_session_count() >= MAX_SESSIONS:
-            return json.dumps(
-                {
-                    "session_id": session_id,
-                    "error": f"Maximum active session limit reached ({MAX_SESSIONS}). Please reset an existing session before creating a new one.",
-                }
-            )
-
-        sessions[session_id] = PythonSession(
-            session_id,
-            nsjail_bin=NSJAIL_BIN,
-            host_venv_python=HOST_VENV_PYTHON,
-            host_repl_runner=HOST_REPL_RUNNER,
-            exec_timeout_seconds=EXEC_TIMEOUT_SECONDS,
-            init_timeout_seconds=INIT_TIMEOUT_SECONDS,
-            process_time_limit_seconds=PROCESS_TIME_LIMIT_SECONDS,
+    try:
+        session, _ = _get_or_create_session(session_id)
+    except Exception as e:
+        return _python_exec_session_error(
+            error_type="session_infrastructure_error",
+            error_message=(
+                str(e)
+                + " "
+                + SESSION_ERROR
+            ),
+            session_status="unavailable",
         )
-
-    session = sessions[session_id]
 
     try:
         output = session.execute(code)
-        return json.dumps(
-            {
-                "session_id": session_id,
-                "output": output,
-            }
+        return _python_exec_success(output)
+    except CodeExecutionError as e:
+        return _python_exec_code_error(str(e))
+    except Exception as e:
+        message = str(e)
+        code_triggered = _is_code_triggered_session_error(message)
+
+        if code_triggered and session is not None:
+            session.close()
+            with sessions_lock:
+                if sessions.get(session_id) is session:
+                    sessions.pop(session_id, None)
+            return _python_exec_session_error(
+                error_type="code_triggered_session_error",
+                error_message=(
+                    message
+                    + " "
+                    + SESSION_ERROR
+                ),
+                session_status="terminated",
+            )
+
+        if session is not None and not _session_is_alive(session):
+            with sessions_lock:
+                if sessions.get(session_id) is session:
+                    sessions.pop(session_id, None)
+
+        return _python_exec_session_error(
+            error_type="session_infrastructure_error",
+            error_message=message,
+            session_status="unavailable",
         )
+    finally:
+        if session is not None and not _session_is_alive(session):
+            with sessions_lock:
+                if sessions.get(session_id) is session:
+                    sessions.pop(session_id, None)
+
+
+@mcp.tool(tags={"internal"})
+def python_create_session(ctx: Context) -> str:
+    """
+    Create a Python session without executing code.
+
+    This tool explicitly starts a sandboxed Python session for the calling client
+    and returns the creation status. Use python_exec() to run code in the same
+    stateful session. If a live session already exists for the same client_id, it
+    is reused.
+
+    Parameters:
+    -----------
+    Returns:
+    --------
+    str (JSON format)
+
+        On Success:
+        {
+            "session_status": "created"
+        }
+
+        On Error:
+        {
+            "session_status": "error"
+            "error_type": "session_infrastructure_error"
+            "error_message": "<str>"
+        }
+    """
+
+    session_id = _require_client_id(ctx)
+
+    try:
+        _, created = _get_or_create_session(session_id)
     except Exception as e:
         return json.dumps(
             {
-                "session_id": session_id,
-                "error": str(e),
+                "session_status": "error",
+                "error_type": "session_infrastructure_error",
+                "error_message": str(e),
             }
         )
 
+    return json.dumps(
+        {
+            "session_status": "created" if created else "existing",
+        }
+    )
 
-@mcp.tool()
-def python_reset(session_id: str) -> str:
+
+@mcp.tool(tags={"internal"})
+def python_reset_session(ctx: Context) -> str:
     """
     Terminate and reset a Python session, freeing all resources.
 
@@ -335,34 +505,27 @@ def python_reset(session_id: str) -> str:
     After reset, the session_id cannot be reused and any variables/state are lost.
     Useful for freeing resources or starting fresh without waiting for session timeout.
 
-    Parameters:
-    -----------
-    session_id : str
-        The unique identifier of the session to reset. Must be a valid session_id that
-        was previously created by python_exec(). Attempting to reset a non-existent
-        session returns "not_found" status without error.
-
     Returns:
     --------
     str (JSON format)
 
         On Success (session existed and was closed):
         {
-            "status": "reset"
+            "session_status": "reset"
         }
 
         On Session Not Found:
         {
-            "status": "not_found"
+            "session_status": "not_found"
         }
     """
 
-    if session_id in sessions:
-        sessions[session_id].close()
-        del sessions[session_id]
-        return json.dumps({"status": "reset"})
+    session_id = _require_client_id(ctx)
 
-    return json.dumps({"status": "not_found"})
+    if _reset_session(session_id):
+        return json.dumps({"session_status": "reset"})
+
+    return json.dumps({"session_status": "not_found"})
 
 
 # -----------------------------
@@ -370,4 +533,4 @@ def python_reset(session_id: str) -> str:
 # -----------------------------
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="stdio")

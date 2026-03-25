@@ -19,12 +19,12 @@ async def create_use_and_reset(session, session_id: str, cycle_index: int) -> di
                 "print(counter)\n"
                 "print(counter + 1)\n"
             ),
-            "session_id": session_id,
         },
+        meta={"client_id": session_id},
     )
     timings["create_and_first_exec"] = time.perf_counter() - started_at
     first_payload = tool_json(first_result)
-    assert first_payload["output"].splitlines() == ["1", "2"]
+    assert first_payload["interpreter_output"].splitlines() == ["1", "2"]
 
     started_at = time.perf_counter()
     second_result = await session.call_tool(
@@ -36,36 +36,44 @@ async def create_use_and_reset(session, session_id: str, cycle_index: int) -> di
                 "print(math.sqrt(value * value))\n"
                 "print(value * 3)\n"
             ),
-            "session_id": session_id,
         },
+        meta={"client_id": session_id},
     )
     timings["second_exec"] = time.perf_counter() - started_at
     second_payload = tool_json(second_result)
-    assert abs(float(second_payload["output"].splitlines()[0]) - float(cycle_index + 2)) < 1e-9
+    assert abs(float(second_payload["interpreter_output"].splitlines()[0]) - float(cycle_index + 2)) < 1e-9
 
     started_at = time.perf_counter()
-    reset_result = await session.call_tool("python_reset", {"session_id": session_id})
+    reset_result = await session.call_tool(
+        "python_reset_session",
+        {},
+        meta={"client_id": session_id},
+    )
     timings["reset"] = time.perf_counter() - started_at
     reset_payload = tool_json(reset_result)
-    assert reset_payload == {"status": "reset"}
+    assert reset_payload == {"session_status": "reset"}
 
     started_at = time.perf_counter()
     recreated_result = await session.call_tool(
         "python_exec",
         {
             "code": "print('session recreated')",
-            "session_id": session_id,
         },
+        meta={"client_id": session_id},
     )
     timings["recreate_after_reset"] = time.perf_counter() - started_at
     recreated_payload = tool_json(recreated_result)
-    assert recreated_payload["output"] == "session recreated\n"
+    assert recreated_payload["interpreter_output"] == "session recreated\n"
 
     started_at = time.perf_counter()
-    cleanup_result = await session.call_tool("python_reset", {"session_id": session_id})
+    cleanup_result = await session.call_tool(
+        "python_reset_session",
+        {},
+        meta={"client_id": session_id},
+    )
     timings["cleanup_reset"] = time.perf_counter() - started_at
     cleanup_payload = tool_json(cleanup_result)
-    assert cleanup_payload == {"status": "reset"}
+    assert cleanup_payload == {"session_status": "reset"}
 
     return timings
 

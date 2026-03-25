@@ -1,0 +1,5 @@
+{"messages":[{"role":"user","content":"计算 17 + 28 的结果，并给出最终答案。"}]}
+{"messages":[{"role":"user","content":"解方程 3x - 7 = 20，求 x 的值。"}]}
+{"messages":[{"role":"user","content":"一个长方形的长是 12，宽是 8，求它的面积。"}]}
+{"messages":[{"role":"user","content":"求 1 到 10 的所有整数之和。"}]}
+{"messages":[{"role":"user","content":"若一个数的 25% 等于 18，这个数是多少？"}]}

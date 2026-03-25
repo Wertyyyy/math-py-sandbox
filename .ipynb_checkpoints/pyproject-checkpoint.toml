@@ -11,6 +11,5 @@ dependencies = [
     "fastmcp",
     "mcp",
     "pytest",
-    "vllm",
-    "ipykernel"
+    "vllm"
 ]

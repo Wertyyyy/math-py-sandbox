@@ -13,53 +13,69 @@ async def scenario() -> None:
             "python_exec",
             {
                 "code": "counter = 41\ndef bump(value):\n    return value + 1\nprint(counter)\nprint(bump(counter))",
-                "session_id": session_id,
             },
+            meta={"client_id": session_id},
         )
         payload = tool_json(result)
-        assert payload["output"] == "41\n42\n"
+        assert payload["execution_status"] == "success"
+        assert payload["error_type"] is None
+        assert payload["interpreter_output"] == "41\n42\n"
 
         result = await session.call_tool(
             "python_exec",
-            {"code": "print(counter * 2)", "session_id": session_id},
+            {"code": "print(counter * 2)"},
+            meta={"client_id": session_id},
         )
         payload = tool_json(result)
-        assert payload["output"] == "82\n"
+        assert payload["execution_status"] == "success"
+        assert payload["error_type"] is None
+        assert payload["interpreter_output"] == "82\n"
 
         result = await session.call_tool(
             "python_exec",
-            {"code": "print(counter)", "session_id": "isolated-session"},
+            {"code": "print(counter)"},
+            meta={"client_id": "isolated-session"},
         )
         payload = tool_json(result)
-        error_text = payload.get("error", "") + payload.get("output", "")
-        assert "NameError" in error_text
+        assert payload["execution_status"] == "code_error"
+        assert payload["error_type"] == "code_execution_error"
+        assert "NameError" in payload["interpreter_output"]
 
         result = await session.call_tool(
             "python_exec",
-            {"code": "1 / 0", "session_id": session_id},
+            {"code": "1 / 0"},
+            meta={"client_id": session_id},
         )
         payload = tool_json(result)
-        assert payload["session_id"] == session_id
-        assert "ZeroDivisionError" in payload["output"]
+        assert payload["execution_status"] == "code_error"
+        assert payload["error_type"] == "code_execution_error"
+        assert "ZeroDivisionError" in payload["interpreter_output"]
 
         result = await session.call_tool(
             "python_exec",
-            {"code": "print('still alive after exception')", "session_id": session_id},
+            {"code": "print('still alive after exception')"},
+            meta={"client_id": session_id},
         )
         payload = tool_json(result)
-        assert payload["output"] == "still alive after exception\n"
+        assert payload["interpreter_output"] == "still alive after exception\n"
 
-        reset_result = await session.call_tool("python_reset", {"session_id": session_id})
+        reset_result = await session.call_tool(
+            "python_reset_session",
+            {},
+            meta={"client_id": session_id},
+        )
         reset_payload = tool_json(reset_result)
-        assert reset_payload == {"status": "reset"}
+        assert reset_payload == {"session_status": "reset"}
 
         result = await session.call_tool(
             "python_exec",
-            {"code": "print(counter)", "session_id": session_id},
+            {"code": "print(counter)"},
+            meta={"client_id": session_id},
         )
         payload = tool_json(result)
-        error_text = payload.get("error", "") + payload.get("output", "")
-        assert "terminated" in error_text.lower() or "nameerror" in error_text.lower()
+        assert payload["execution_status"] == "code_error"
+        assert payload["error_type"] == "code_execution_error"
+        assert "NameError" in payload["interpreter_output"]
 
 
 def test_mcp_stdio_state_and_errors() -> None:

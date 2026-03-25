@@ -10,10 +10,15 @@ async def measure_session_creation_once(session, session_id: str) -> float:
     started_at = time.perf_counter()
     result = await session.call_tool(
         "python_exec",
-        {"code": "pass", "session_id": session_id},
+        {"code": "pass"},
+        meta={"client_id": session_id},
     )
     payload = tool_json(result)
-    assert payload["session_id"] == session_id
+    assert payload["execution_status"] == "success"
+    assert payload["session_status"] == "active"
+    assert payload["error_type"] is None
+    assert payload["error_message"] is None
+    assert payload["interpreter_output"] == ""
     return time.perf_counter() - started_at
 
 

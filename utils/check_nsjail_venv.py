@@ -7,6 +7,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "4")
+
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 NSJAIL_BIN = PROJECT_DIR / "nsjail" / "nsjail"
@@ -24,6 +29,14 @@ CLONE_SWITCHES = [
     "--disable_clone_newipc",
     "--disable_clone_newuts",
     "--disable_clone_newcgroup",
+]
+
+
+THREAD_ENV_VARS = [
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
 ]
 
 
@@ -63,6 +76,8 @@ def nsjail_command(extra_args: list[str], python_path: str, code: str) -> list[s
         "--quiet",
         "--time_limit",
         "10",
+        "--keep_env",
+        *[item for name in THREAD_ENV_VARS for item in ("--env", name)],
         *extra_args,
         "--",
         python_path,
@@ -100,6 +115,8 @@ def probe_nsjail_jail_root() -> bool:
     command = [
         str(NSJAIL_BIN),
         "--quiet",
+        "--keep_env",
+        *[item for name in THREAD_ENV_VARS for item in ("--env", name)],
         "--chroot",
         str(JAIL_ROOT_DIR),
         "--cwd",
